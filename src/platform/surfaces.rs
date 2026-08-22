@@ -14,7 +14,7 @@ impl SurfaceLayer {
     fn to_layer(self) -> Layer {
         match self {
             SurfaceLayer::Front => Layer::Top,
-            SurfaceLayer::Desktop => Layer::Background,
+            SurfaceLayer::Desktop => Layer::Bottom,
         }
     }
 }

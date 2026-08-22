@@ -1339,7 +1339,7 @@ impl render::DragResizeHandler for Controller {
         // end was missed (cancelled), so nothing gets stuck lifted or capturing.
         if let Some(prev) = self.lifted_surface.take() {
             if let Some(surf) = self.manager.surfaces().get(prev) {
-                surf.window.set_layer(ShellLayer::Background);
+                surf.window.set_layer(ShellLayer::Bottom);
             }
         }
         if let Some(prev) = self.drag_input_surface.take() {
@@ -1384,7 +1384,7 @@ impl render::DragResizeHandler for Controller {
         // Undo the Overlay lift (Desktop only).
         if let Some(idx) = self.lifted_surface.take() {
             if let Some(surf) = self.manager.surfaces().get(idx) {
-                surf.window.set_layer(ShellLayer::Background);
+                surf.window.set_layer(ShellLayer::Bottom);
             }
         }
         // Restore the precise note-union input region for whatever surface got the
