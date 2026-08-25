@@ -26,6 +26,12 @@ rustPlatform.buildRustPackage {
   postInstall = ''
     install -Dm644 assets/waynote.svg \
       $out/share/icons/hicolor/scalable/apps/waynote.svg
+    install -Dm644 packaging/waynote.desktop \
+      $out/share/applications/waynote.desktop
+    install -Dm644 packaging/waynote.service \
+      $out/share/systemd/user/waynote.service
+    substituteInPlace $out/share/systemd/user/waynote.service \
+      --replace-fail "ExecStart=/usr/bin/waynote" "ExecStart=$out/bin/waynote"
   '';
 
   meta = {

@@ -71,6 +71,37 @@ Either one installs the `waynote` binary, a desktop entry, the tray icon, and a
 runtime dependencies automatically. Nothing else to do — skip to
 [Running the app](#running-the-app).
 
+### Nix (flake)
+
+The repo ships a Nix flake. It builds the binary and installs the desktop
+entry, the tray icon, and the systemd user unit:
+
+```sh
+nix run github:mryll/waynote        # run without installing
+nix profile install github:mryll/waynote
+nix develop                         # dev shell with cargo, clippy, rust-analyzer
+```
+
+Do **not** run `waynote install-user-assets` on a Nix install: it writes the
+wrapped store binary into the generated unit, which bypasses the GTK wrapper
+and breaks after garbage collection. Do **not** use
+`systemctl --user enable waynote.service` either — systemd can resolve the
+profile link to a versioned store path. Instead, link the packaged unit
+through the stable profile path:
+
+```sh
+user_units="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
+mkdir -p "$user_units/graphical-session.target.wants"
+ln -sfn "$HOME/.nix-profile/share/systemd/user/waynote.service" \
+  "$user_units/waynote.service"
+ln -sfn ../waynote.service \
+  "$user_units/graphical-session.target.wants/waynote.service"
+systemctl --user daemon-reload
+systemctl --user start waynote.service
+```
+
+Run `systemctl --user daemon-reload` after upgrading Waynote.
+
 ### From source
 
 You'll need a `wlr-layer-shell` compositor (see
