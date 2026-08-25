@@ -125,7 +125,10 @@ impl Controller {
                 hash: ln.disk_hash.clone(),
             });
 
-            let saved = self.layout.get(&id).cloned();
+            let saved = SavedView {
+                geometry: self.layout.get(&id).cloned(),
+                collapsed: self.layout.collapsed(&id),
+            };
             let entry = make_entry(&self.paths, saved, &self.config.default_size, i, ln.note, ln.path, ln.disk_hash);
             self.entries.insert(id, entry);
         }
@@ -305,7 +308,10 @@ impl Controller {
         let id = note.id.clone();
         let surf_idx = {
             let mut c = this.borrow_mut();
-            let saved = c.layout.get(&id).cloned();
+            let saved = SavedView {
+                geometry: c.layout.get(&id).cloned(),
+                collapsed: c.layout.collapsed(&id),
+            };
             let index = c.entries.len();
             let entry = make_entry(&c.paths, saved, &c.config.default_size, index, note, path.clone(), disk_hash.clone());
             c.entries.insert(id.clone(), entry);
@@ -363,6 +369,63 @@ impl Controller {
             NoteEvent::TaskToggled(idx) => self.on_task_toggled(id, idx),
             NoteEvent::ColorRequested(color) => self.on_color_requested(id, color),
             NoteEvent::PasteImageRequested => {} // handled via paste_image in the idle closure
+            NoteEvent::CollapseToggled => self.on_collapse_toggled(id),
+        }
+    }
+
+    /// Roll note `id` up to its header bar, or unroll it.
+    ///
+    /// The order is load-bearing:
+    /// 1. Commit the editor ONLY when it is this same note — rolling up note A must
+    ///    not end an edit session on note B.
+    /// 2. Flip the model, then persist geometry AND the flag together.
+    /// 3. Resolve the surface AFTER the commit: `commit_current_editor` returns a
+    ///    Desktop note to its own layer, so an index taken earlier would be stale.
+    /// 4. Let the presenter do the rest — it is the only path that re-measures the
+    ///    card, rebuilds the input region and repaints the freed area.
+    fn on_collapse_toggled(&mut self, id: &NoteId) {
+        if !self.entries.contains_key(id) {
+            return;
+        }
+        if self.active_editor.as_deref() == Some(id) {
+            self.commit_current_editor(id);
+        }
+        if let Some(entry) = self.entries.get_mut(id) {
+            entry.collapsed = !entry.collapsed;
+        }
+        self.stage_layout(id);
+        self.flush_layout("collapse save");
+        let surf_idx = presenter::surface_index_for(self, id);
+        presenter::sync_surface(self, surf_idx);
+    }
+
+    /// The rect note `id` currently occupies, straight from the presenter — the one
+    /// derivation shared by the widget, the input region and the drag gesture.
+    fn on_screen_rect(&self, id: &NoteId) -> Option<Rect> {
+        let entry = self.entries.get(id)?;
+        let bounds = surface_bounds(self, presenter::surface_index_for(self, id));
+        Some(presenter::effective_rect(entry, bounds))
+    }
+
+    /// Mirror one entry's layout state into `self.layout`, geometry AND roll-up
+    /// flag together. `Layout::set` replaces the whole record, so writing the
+    /// geometry alone would silently unroll the note on every drag/resize commit.
+    fn stage_layout(&mut self, id: &NoteId) {
+        let Some((geom, collapsed)) = self
+            .entries
+            .get(id)
+            .map(|e| (e.geometry.clone(), e.collapsed))
+        else {
+            return;
+        };
+        self.layout.set(id, geom, collapsed);
+    }
+
+    /// Write `layout.toml`, reporting a failure under `context` without aborting —
+    /// a lost layout write costs a position, never a note.
+    fn flush_layout(&self, context: &str) {
+        if let Err(e) = layout::save(&self.paths, &self.layout) {
+            eprintln!("[waynote] {context} failed: {e}");
         }
     }
 
@@ -517,25 +580,45 @@ impl Controller {
     /// React to a persist outcome: update watcher state and toggle the per-note
     /// conflict indicator on the chrome.
     fn after_persist(&mut self, id: &NoteId, outcome: PersistOutcome) {
-        match outcome {
+        let changed = match outcome {
             PersistOutcome::Saved(hash) => {
-                if let Some(entry) = self.entries.get_mut(id) {
-                    entry.conflict = false;
-                    entry.chrome.set_conflict(false);
-                }
+                let changed = self.set_conflict(id, false);
                 self.record_own_write(id, &hash);
+                changed
             }
             PersistOutcome::Conflict(path) => {
                 eprintln!(
                     "[waynote] save conflict for {id}: wrote conflict copy {}",
                     path.display()
                 );
-                if let Some(entry) = self.entries.get_mut(id) {
-                    entry.conflict = true;
-                    entry.chrome.set_conflict(true);
-                }
+                self.set_conflict(id, true)
             }
+        };
+        // The conflict pill is a real Label in the header's control cluster, so
+        // showing or hiding it changes what GTK will allocate the card — and the
+        // input region is built from that size. Without this the region keeps the
+        // old width: too narrow (a visible strip that takes no clicks) when the
+        // pill appears, too wide (an invisible strip that steals them) when it goes.
+        //
+        // `sync_all`, not `sync_surface`: `after_persist` also runs inside
+        // `set_layer_durable`, where the note is moving between surfaces — a
+        // single-surface sync could try to add the widget before the old surface
+        // has released it.
+        if changed {
+            presenter::sync_all(self);
         }
+    }
+
+    /// Set the conflict flag on the model AND the chrome. Returns whether it moved,
+    /// so the caller can reconcile only on a real change.
+    fn set_conflict(&mut self, id: &NoteId, conflict: bool) -> bool {
+        let Some(entry) = self.entries.get_mut(id) else { return false };
+        if entry.conflict == conflict {
+            return false;
+        }
+        entry.conflict = conflict;
+        entry.chrome.set_conflict(conflict);
+        true
     }
 
     /// Record an own-write hash + refresh the `known` baseline for `id` so the
@@ -924,16 +1007,26 @@ fn update_or_insert_known(ws: &mut WatchState, id: &NoteId, path: &str, hash: &s
 /// resolved geometry. The SHARED builder used by both startup (`load_notes`) and
 /// the watcher-apply path (`insert_note`) so the wiring is identical. The event
 /// handler is installed by the caller (it needs the `Rc<RefCell<Controller>>`).
+/// The per-note view state restored from `layout.toml`. Grouped so the two halves
+/// travel together — reading the geometry without the roll-up flag is how a note
+/// silently unrolls itself on restart.
+struct SavedView {
+    /// `None` = this note has no saved layout; place it on the default grid.
+    geometry: Option<Geometry>,
+    collapsed: bool,
+}
+
 fn make_entry(
     paths: &Paths,
-    saved: Option<Geometry>,
+    saved: SavedView,
     default_size: &[i32; 2],
     fallback_index: usize,
     note: crate::core::note::Note,
     path: std::path::PathBuf,
     disk_hash: String,
 ) -> NoteEntry {
-    let geometry = saved.unwrap_or_else(|| default_geometry(default_size, fallback_index));
+    let SavedView { geometry, collapsed } = saved;
+    let geometry = geometry.unwrap_or_else(|| default_geometry(default_size, fallback_index));
     let rect = Rect { x: geometry.x, y: geometry.y, w: geometry.w, h: geometry.h };
     let chrome = build_chrome(paths, &note.id, &note, rect);
     let surface_key = SurfaceKey {
@@ -949,6 +1042,7 @@ fn make_entry(
         edit_base_hash: None,
         surface_key,
         hidden: false,
+        collapsed,
         conflict: false,
         pending_layout_save: None,
         temporarily_fronted: false,
@@ -968,9 +1062,12 @@ fn content_width_for(w: i32) -> i32 {
 /// PURE: re-point a geometry at the `target` monitor — copy its connector,
 /// description and logical rect, and clamp the (monitor-local) x/y into the
 /// target's size so the note lands on-screen. The note's size (w/h) is unchanged.
-fn retarget_geometry_to_monitor(g: &Geometry, target: &MonitorInfo) -> Geometry {
+fn retarget_geometry_to_monitor(g: &Geometry, target: &MonitorInfo, on_screen_h: i32) -> Geometry {
     let bounds = Rect { x: 0, y: 0, w: target.logical[2], h: target.logical[3] };
-    let placed = crate::platform::geometry::clamp_into(Rect { x: g.x, y: g.y, w: g.w, h: g.h }, bounds);
+    // Clamp by what the note actually occupies (`on_screen_h`), not by `g.h`: a
+    // rolled-up note is only a bar tall and must be allowed right up to the bottom
+    // edge. `g.h` itself is left untouched — it is the height to restore on unroll.
+    let placed = crate::platform::geometry::clamp_into(Rect { x: g.x, y: g.y, w: g.w, h: on_screen_h }, bounds);
     Geometry {
         output: target.output_id.clone(),
         output_desc: target.description.clone(),
@@ -1127,16 +1224,22 @@ fn rerender_later(note_view: &Rc<RefCell<render::NoteView>>, raw: String) {
 // ── Task 9 (C1): wire drag+resize — implement DragResizeHandler for Controller ──
 
 impl render::DragResizeHandler for Controller {
+    /// The note's ON-SCREEN origin — the same rect the presenter placed, not the raw
+    /// model position.
+    ///
+    /// These differ: a rolled-up note may sit where its expanded self would not fit
+    /// (a bar 43px tall can reach the bottom edge), and `geometry` keeps that
+    /// position while the presenter clamps the unrolled note back into view. Handing
+    /// the drag gesture the unclamped origin made the note refuse to follow the
+    /// pointer until the delta exceeded the clamp — a note that felt stuck.
     fn entry_position(&self, id: &NoteId) -> (i32, i32) {
-        self.entries.get(id)
-            .map(|e| (e.geometry.x, e.geometry.y))
-            .unwrap_or((0, 0))
+        self.on_screen_rect(id).map_or((0, 0), |r| (r.x, r.y))
     }
 
+    /// The note's ON-SCREEN size — a rolled-up note reports its bar, and any note
+    /// reports what GTK actually allocates. Same rect as `entry_position`.
     fn entry_size(&self, id: &NoteId) -> (i32, i32) {
-        self.entries.get(id)
-            .map(|e| (e.geometry.w, e.geometry.h))
-            .unwrap_or((200, 150))
+        self.on_screen_rect(id).map_or((200, 150), |r| (r.w, r.h))
     }
 
     fn current_bounds(&self, id: &NoteId) -> crate::platform::geometry::Rect {
@@ -1185,6 +1288,7 @@ impl render::DragResizeHandler for Controller {
     }
 
     fn commit_move(&mut self, id: &NoteId, x: i32, y: i32) {
+        // (see `stage_layout` for why geometry is never written on its own)
         if let Some(entry) = self.entries.get_mut(id) {
             if let Some(src) = entry.pending_layout_save.take() {
                 src.remove();
@@ -1192,12 +1296,8 @@ impl render::DragResizeHandler for Controller {
             entry.geometry.x = x;
             entry.geometry.y = y;
         }
-        if let Some(geom) = self.entries.get(id).map(|e| e.geometry.clone()) {
-            self.layout.set(id, geom);
-            if let Err(e) = layout::save(&self.paths, &self.layout) {
-                eprintln!("[waynote] geometry save failed: {e}");
-            }
-        }
+        self.stage_layout(id);
+        self.flush_layout("geometry save");
         let surf_idx = presenter::surface_index_for(self, id);
         presenter::sync_surface(self, surf_idx);
     }
@@ -1210,12 +1310,8 @@ impl render::DragResizeHandler for Controller {
             entry.geometry.w = w;
             entry.geometry.h = h;
         }
-        if let Some(geom) = self.entries.get(id).map(|e| e.geometry.clone()) {
-            self.layout.set(id, geom);
-            if let Err(e) = layout::save(&self.paths, &self.layout) {
-                eprintln!("[waynote] geometry save failed: {e}");
-            }
-        }
+        self.stage_layout(id);
+        self.flush_layout("geometry save");
         // Keep the note's content width (→ image fit) in sync with the new size, so
         // a resized note never renders images wider than itself. Re-renders only if
         // in view mode (the method guards); in edit mode it just updates state and
@@ -1474,14 +1570,15 @@ impl Controller {
                 eprintln!("[waynote] move_to_monitor: invalid monitor index {target_idx}");
                 return;
             };
+            // Measure the on-screen height BEFORE taking the mutable borrow: a
+            // rolled-up note must be clamped by its bar, not by the expanded height
+            // it will have again once unrolled.
+            let Some(on_screen_h) = c.on_screen_rect(id).map(|r| r.h) else { return };
             let Some(entry) = c.entries.get_mut(id) else { return };
-            entry.geometry = retarget_geometry_to_monitor(&entry.geometry, &target);
+            entry.geometry = retarget_geometry_to_monitor(&entry.geometry, &target, on_screen_h);
             entry.surface_key.output_id = target.output_id.clone(); // keep key in sync
-            let geom = entry.geometry.clone();
-            c.layout.set(id, geom);
-            if let Err(e) = layout::save(&c.paths, &c.layout) {
-                eprintln!("[waynote] move_to_monitor: layout save failed: {e}");
-            }
+            c.stage_layout(id);
+            c.flush_layout("move_to_monitor: layout save");
         }
         presenter::sync_all(&mut this.borrow_mut());
 
@@ -1528,23 +1625,27 @@ impl Controller {
                 eprintln!("[waynote] move_all_to_monitor: invalid monitor index {target_idx}");
                 return;
             };
-            // Phase 1: retarget each entry's geometry; collect (id, geom) for layout.
-            let geoms: Vec<(NoteId, crate::platform::layout::Geometry)> = c
+            // Phase 1: retarget each entry's geometry; collect the ids for layout.
+            // Measure every note BEFORE mutating any geometry: `on_screen_rect`
+            // borrows `entries` immutably, so it cannot run inside the mutation.
+            let heights: Vec<(NoteId, i32)> = c
                 .entries
-                .iter_mut()
-                .map(|(id, entry)| {
-                    entry.geometry = retarget_geometry_to_monitor(&entry.geometry, &target);
-                    entry.surface_key.output_id = target.output_id.clone();
-                    (id.clone(), entry.geometry.clone())
-                })
+                .keys()
+                .map(|id| (id.clone(), c.on_screen_rect(id).map_or(0, |r| r.h)))
                 .collect();
+            let mut moved: Vec<NoteId> = Vec::with_capacity(heights.len());
+            for (id, on_screen_h) in heights {
+                let Some(entry) = c.entries.get_mut(&id) else { continue };
+                entry.geometry =
+                    retarget_geometry_to_monitor(&entry.geometry, &target, on_screen_h);
+                entry.surface_key.output_id = target.output_id.clone();
+                moved.push(id);
+            }
             // Phase 2: flush to layout (entries borrow released).
-            for (id, geom) in geoms {
-                c.layout.set(&id, geom);
+            for id in moved {
+                c.stage_layout(&id);
             }
-            if let Err(e) = layout::save(&c.paths, &c.layout) {
-                eprintln!("[waynote] move_all_to_monitor: layout save failed: {e}");
-            }
+            c.flush_layout("move_all_to_monitor: layout save");
         }
         presenter::sync_all(&mut this.borrow_mut());
 
@@ -1940,8 +2041,12 @@ impl Controller {
         let resized: Vec<(Rc<RefCell<render::NoteView>>, i32)>;
         {
             let mut c = this.borrow_mut();
-            // First pass: update geometry on each entry and collect (id, geom) pairs.
-            let geoms: Vec<(NoteId, crate::platform::layout::Geometry)> = placements
+            // First pass: update geometry on each entry and collect the ids.
+            // A rolled-up note STAYS rolled up: it takes the full cell's geometry
+            // (so unrolling restores the arranged size) but keeps drawing as a bar,
+            // leaving a gap in its column. A grid of mixed cell heights is a much
+            // bigger change than auto-arrange warrants.
+            let arranged: Vec<NoteId> = placements
                 .iter()
                 .filter_map(|(id, rect)| {
                     let entry = c.entries.get_mut(id)?;
@@ -1949,12 +2054,12 @@ impl Controller {
                     entry.geometry.y = rect.y;
                     entry.geometry.w = rect.w;
                     entry.geometry.h = rect.h;
-                    Some((id.clone(), entry.geometry.clone()))
+                    Some(id.clone())
                 })
                 .collect();
             // Second pass: flush to layout (no aliasing — entries borrow is released).
-            for (id, geom) in geoms {
-                c.layout.set(&id, geom);
+            for id in arranged {
+                c.stage_layout(&id);
             }
             if let Err(e) = layout::save(&paths, &c.layout) {
                 eprintln!("[waynote] arrange: layout save failed: {e}");
@@ -2159,6 +2264,7 @@ impl Controller {
                 edit_base_hash: None,
                 surface_key: surface_key.clone(),
                 hidden: false,
+                collapsed: false, // a brand-new note always starts unrolled
                 conflict: false,
                 pending_layout_save: None,
                 temporarily_fronted: false,
@@ -2583,7 +2689,7 @@ mod tests {
             logical: [2560, 0, 1920, 1080],
             index: 1,
         };
-        let r = retarget_geometry_to_monitor(&g, &target);
+        let r = retarget_geometry_to_monitor(&g, &target, g.h);
         assert_eq!(r.output, "HDMI-1");
         assert_eq!(r.output_desc, "Right");
         assert_eq!(r.logical, [2560, 0, 1920, 1080]);
@@ -2591,6 +2697,34 @@ mod tests {
         assert_eq!(r.x, 1640);
         assert_eq!(r.y, 100);
         assert_eq!((r.w, r.h), (280, 220), "size unchanged");
+    }
+
+    #[test]
+    fn a_rolled_up_note_can_sit_where_its_expanded_height_would_not_fit() {
+        // Near the bottom edge: expanded (220 tall) it must be pushed up, but as a
+        // 43px bar it fits exactly where the user left it.
+        let g = Geometry {
+            output: "DP-1".into(),
+            output_desc: "Left".into(),
+            logical: [0, 0, 1920, 1080],
+            x: 100,
+            y: 1030,
+            w: 280,
+            h: 220,
+        };
+        let target = MonitorInfo {
+            output_id: "DP-1".into(),
+            description: "Left".into(),
+            logical: [0, 0, 1920, 1080],
+            index: 0,
+        };
+
+        let expanded = retarget_geometry_to_monitor(&g, &target, g.h);
+        assert_eq!(expanded.y, 1080 - 220, "expanded, it is pulled back on-screen");
+
+        let rolled_up = retarget_geometry_to_monitor(&g, &target, 43);
+        assert_eq!(rolled_up.y, 1030, "as a bar it already fits — leave it alone");
+        assert_eq!(rolled_up.h, 220, "the height to restore on unroll is preserved");
     }
 
     fn mon_info(index: usize, out: &str) -> MonitorInfo {

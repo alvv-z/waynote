@@ -54,6 +54,10 @@ pub struct NoteEntry {
     #[allow(dead_code)]
     pub surface_key: SurfaceKey,
     pub hidden: bool,
+    /// Rolled up to its header bar. Presentation state, so it lives here and in
+    /// `layout.toml` — never in the note's `.md`, which would make a view toggle
+    /// rewrite the file, wake the watcher and risk a sync conflict copy.
+    pub collapsed: bool,
     /// Set when the last save attempt produced a conflict copy; cleared on the
     /// next successful save. The chrome shows a ⚠ pill while this is true.
     pub conflict: bool,

@@ -315,6 +315,19 @@ button.waynote-layer-btn:disabled label {
     min-width: 10px;
     min-height: 10px;
 }
+/* Rolled up (window-shade): the content is hidden by the widget tree, so only the
+   card's own vertical padding and the header's divider still claim height. Both
+   paddings shrink together — dropping only one gives a lopsided bar. The
+   `.waynote-conflict` selector is repeated so a conflicting note's extra
+   border-bottom cannot make its collapsed bar 1px taller than a clean one. */
+.waynote-card.waynote-collapsed {
+    padding-top: 4px;
+    padding-bottom: 4px;
+}
+.waynote-card.waynote-collapsed .waynote-header,
+.waynote-card.waynote-collapsed .waynote-header.waynote-conflict {
+    border-bottom: none;
+}
 /* Conflict indicator: a subtle amber tint on the header strip plus a real
    Label pill (toggled by set_visible — no CSS pseudo-elements, which are
    version-fragile in GTK). The Controller calls NoteChrome::set_conflict(). */
@@ -1117,9 +1130,11 @@ fn apply_over_range(buffer: &gtk::TextBuffer, start_off: i32, end_off: i32, tag:
 
 // ── NoteView — Task 9: view/edit toggle ──────────────────────────────────────
 
-/// Events a `NoteView` emits to its single installed handler. The NoteView no
-/// longer mutates the model/disk itself — the Controller owns saving and decides
-/// what each event means (Plan 5 Task 5).
+/// Events a note emits to its single installed handler. Most come from the
+/// `NoteView` (content), but `CollapseToggled` comes from the surrounding
+/// `NoteChrome` (header) — both share the one `EventSink`. The view no longer
+/// mutates the model/disk itself: the Controller owns saving and decides what
+/// each event means (Plan 5 Task 5).
 #[derive(Debug, Clone, PartialEq)]
 pub enum NoteEvent {
     /// Double-click entered edit mode.
@@ -1134,6 +1149,9 @@ pub enum NoteEvent {
     ColorRequested(String),
     /// Ctrl+V in the edit page with an image on the clipboard.
     PasteImageRequested,
+    /// Double-click on the header drag handle: roll the note up to its bar, or
+    /// unroll it. Emitted by `NoteChrome`, not by the `NoteView`.
+    CollapseToggled,
 }
 
 /// The single installed event handler.
@@ -1425,6 +1443,49 @@ fn attach_double_click(view: &TextView, sink: EventSink) {
         emit(&sink, NoteEvent::EditRequested);
     });
     view.add_controller(gesture);
+}
+
+/// Attach the double-click→roll-up gesture to the header's drag handle.
+///
+/// Three details are load-bearing:
+///
+/// - `n_press == 2`, not `>= 2`: with `>=`, a third click would flip the note
+///   straight back and a rapid burst would leave it wherever it landed.
+/// - `released`, not `pressed`: collapsing resizes the widget out from under the
+///   pointer, which must not happen mid-press. GTK holds an implicit grab between
+///   press and release, so the release still arrives once the note has shrunk.
+/// - the `stopped` guard: GTK may emit `stopped` between the press and the
+///   release (e.g. the pointer starts dragging), and the later `released` still
+///   carries the same `n_press`. Without the guard, "click, press, drag, release"
+///   would roll the note up in the middle of a drag.
+///
+/// This gesture and the header's `GestureDrag` both sit on `drag_handle`, both in
+/// the default `Bubble` phase and deliberately UNGROUPED: neither claims the
+/// sequence, so both observe it. Grouping would sync their states and let one
+/// cancel the other.
+fn attach_collapse_gesture(drag_handle: &gtk::Box, sink: EventSink) {
+    let gesture = GestureClick::new();
+    gesture.set_button(1);
+
+    let stopped = Rc::new(std::cell::Cell::new(false));
+
+    let stopped_press = stopped.clone();
+    gesture.connect_pressed(move |_g, n_press, _x, _y| {
+        if n_press == 2 {
+            stopped_press.set(false);
+        }
+    });
+
+    let stopped_cancel = stopped.clone();
+    gesture.connect_stopped(move |_g| stopped_cancel.set(true));
+
+    gesture.connect_released(move |_g, n_press, _x, _y| {
+        if n_press == 2 && !stopped.get() {
+            emit(&sink, NoteEvent::CollapseToggled);
+        }
+    });
+
+    drag_handle.add_controller(gesture);
 }
 
 /// Wrap a `TextView` (which implements `GtkScrollable`) in a `ScrolledWindow` so
@@ -1946,6 +2007,8 @@ impl NoteChrome {
         root.set_child(Some(&column));
         root.add_overlay(&grip);
 
+        attach_collapse_gesture(&drag_handle, note_view.borrow().handler_sink());
+
         let chrome = NoteChrome {
             root,
             header,
@@ -1974,6 +2037,65 @@ impl NoteChrome {
     /// Update the header title (called after an edit changes the H1).
     pub fn set_title(&self, title: &str) {
         self.title.set_text(title);
+    }
+
+    /// Roll the note up to its header bar, or unroll it.
+    ///
+    /// Hiding `note_view.widget` — a direct child of `column` — takes its whole
+    /// subtree (mode pill, `Stack`, both `ScrolledWindow`s) out of the layout, so
+    /// nothing below the header contributes height any more. The grip is hidden
+    /// too: it is an overlay child and would otherwise keep claiming its own size,
+    /// and a rolled-up note has no height left to drag anyway.
+    ///
+    /// Idempotent — GTK no-ops when the visibility/class is already right — which
+    /// matters because the presenter re-asserts this on every reconcile.
+    pub fn set_collapsed(&self, collapsed: bool) {
+        use gtk::prelude::WidgetExt;
+        self.note_view.borrow().widget.set_visible(!collapsed);
+        self.grip.set_visible(!collapsed);
+        // Guarded like the tooltip below: GTK notifies `css-classes` on every
+        // add/remove call, changed or not.
+        if self.column.has_css_class("waynote-collapsed") != collapsed {
+            if collapsed {
+                self.column.add_css_class("waynote-collapsed");
+            } else {
+                self.column.remove_css_class("waynote-collapsed");
+            }
+        }
+        // Guarded for the same reason: `set_tooltip_text` notifies its property on
+        // every call, and the presenter re-asserts all of this on every reconcile.
+        // Keeping `set_collapsed` a literal no-op in the steady state means nothing
+        // downstream can ever mistake it for a change signal and loop.
+        let tip = if collapsed {
+            "Double-click to unroll"
+        } else {
+            "Double-click to roll up"
+        };
+        if self.drag_handle.tooltip_text().is_none_or(|t| t != tip) {
+            self.drag_handle.set_tooltip_text(Some(tip));
+        }
+    }
+
+    /// The size GTK will actually give this card at `width`: its own minimum in
+    /// both axes.
+    ///
+    /// Measures `column`, NOT `root`: the presenter puts a `set_size_request` on
+    /// `root` (the `Overlay`), and in GTK4 that is a floor on the minimum — so
+    /// `root` would keep reporting the old expanded size and the card would never
+    /// shrink. `column` carries the card CSS and has no size request.
+    ///
+    /// Measured rather than computed from constants, so the result follows the
+    /// user's theme, font and scale instead of duplicating the stylesheet. Call
+    /// AFTER `set_collapsed`: a visible content child changes the answer.
+    ///
+    /// The width matters because the header cannot shrink past its controls
+    /// (7 buttons plus the card padding), so a note resized to the drag minimum is
+    /// allocated WIDER than its rect — see `presenter::effective_rect`.
+    pub fn min_size(&self, width: i32) -> (i32, i32) {
+        let (min_w, _, _, _) = self.column.measure(Orientation::Horizontal, -1);
+        // Measure the height at the width GTK will really use, not the model's.
+        let (min_h, _, _, _) = self.column.measure(Orientation::Vertical, width.max(min_w));
+        (min_w, min_h)
     }
 
     /// Update the layer-toggle button to reflect the note's current `layer`.
@@ -2187,9 +2309,17 @@ impl NoteChrome {
         let id_end = id;
         gesture.connect_drag_end(move |g, _off_x, _off_y| {
             let Some(ctrl) = weak_end.upgrade() else { return };
-            // Commit only if we have a valid pointer delta, but ALWAYS restore the
-            // lifted surface on release (incl. a cancelled gesture).
-            if let Some((dx, dy)) = pointer_delta(g, &start_ptr) {
+            // Commit only on a valid AND non-zero delta. `pointer_delta` returns
+            // `None` solely when the event carries no position — never for a still
+            // pointer — so without the `(0,0)` check every plain CLICK on the header
+            // ran a full commit_move: a `layout.toml` write plus a surface sync. That
+            // now fires twice per double-click (the roll-up gesture). A drag that
+            // returns to its exact origin is skipped for the same reason: there is
+            // nothing to save. The lifted surface is ALWAYS restored on release
+            // (including a cancelled gesture), which is what rebuilds the precise
+            // input region.
+            let delta = pointer_delta(g, &start_ptr);
+            if let Some((dx, dy)) = delta.filter(|d| is_real_move(*d)) {
                 let (sx, sy, sw, sh) = start_geom.get();
                 let origin = Rect { x: sx, y: sy, w: sw, h: sh };
                 let new = drag_to(origin, dx, dy, bounds.get());
@@ -2218,7 +2348,13 @@ impl NoteChrome {
     {
         use gtk::GestureDrag;
         use crate::platform::geometry::{resize_to, Rect};
-        const MIN_W: i32 = 160;
+        // 160 was fiction: GTK never honoured it. The header's 7 controls
+        // (`HEADER_BTN_PX` each) plus the card's 32px padding measure ~200, and
+        // `GtkFixed` allocates that regardless — which left the title `Label`
+        // (hexpand + ellipsize) zero width and showing a bare "…". A rolled-up note
+        // whose title is unreadable defeats the point of rolling it up, so the
+        // minimum now reserves room for the title too.
+        const MIN_W: i32 = 260;
         const MIN_H: i32 = 150;
 
         let gesture = GestureDrag::new();
@@ -2301,6 +2437,16 @@ fn event_position(gesture: &gtk::GestureDrag) -> Option<(f64, f64)> {
     gesture.current_event().and_then(|e| e.position())
 }
 
+/// PURE: whether a finished drag actually moved the note.
+///
+/// `pointer_delta` returns `None` only when the event carries no position — never
+/// for a still pointer — so a plain CLICK yields `Some((0, 0))`. Committing that
+/// wrote `layout.toml` and re-synced the surface on every click of the header,
+/// which the roll-up double-click would do twice per toggle.
+fn is_real_move((dx, dy): (i32, i32)) -> bool {
+    dx != 0 || dy != 0
+}
+
 /// Compute the integer surface-space delta from the stored start pointer to the
 /// gesture's current event position. `None` if the current event has no position.
 fn pointer_delta(
@@ -2330,5 +2476,17 @@ mod tests {
     fn list_indent_increases_with_depth() {
         assert!(list_indent(1) > list_indent(0));
         assert!(list_indent(2) > list_indent(1));
+    }
+
+    #[test]
+    fn a_click_that_never_moved_is_not_a_move() {
+        assert!(!is_real_move((0, 0)));
+    }
+
+    #[test]
+    fn a_drag_of_a_single_pixel_on_either_axis_is_a_move() {
+        assert!(is_real_move((1, 0)));
+        assert!(is_real_move((0, -1)));
+        assert!(is_real_move((-3, 7)));
     }
 }

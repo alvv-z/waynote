@@ -62,11 +62,38 @@ fn wanted_for(ctrl: &Controller, surf_idx: usize) -> Vec<(NoteId, Rect, gtk::Wid
         .iter()
         .filter(|(id, e)| !e.hidden && surface_index_for(ctrl, id) == surf_idx)
         .map(|(id, e)| {
-            let g = &e.geometry;
-            let rect = placement_rect(Rect { x: g.x, y: g.y, w: g.w, h: g.h }, bounds);
+            let rect = effective_rect(e, bounds);
             (id.clone(), rect, e.chrome.root.clone().upcast::<gtk::Widget>())
         })
         .collect()
+}
+
+/// The rect a note actually occupies on screen: its model geometry, grown to what
+/// GTK will really allocate, then clamped into `bounds`.
+///
+/// This is the ONE place a note's on-screen rect is derived. Everything that needs
+/// it — the widget size request, the Wayland input region, and the drag gesture's
+/// origin — MUST come through here, or those three stop agreeing.
+///
+/// Three things happen, and the ORDER matters:
+///
+/// 1. Re-assert the roll-up state on the widget, so the model stays the single
+///    source of truth and no builder has to mirror it.
+/// 2. Measure. `set_size_request` is a FLOOR on the minimum, not an exact size, and
+///    `GtkFixed` allocates the child's own requisition — so a note narrower than its
+///    header (7 controls at 24px plus the card's 32px padding) is drawn wider than
+///    its rect. Feeding the region a smaller width leaves a visible strip that
+///    swallows no clicks, with the rightmost buttons inside it. Rolled up, the
+///    height comes from the same measurement rather than a hardcoded bar height.
+/// 3. Clamp — LAST. Clamping the expanded height first would push a rolled-up bar
+///    needlessly far from the bottom edge.
+pub(crate) fn effective_rect(entry: &crate::app::note_entry::NoteEntry, bounds: Rect) -> Rect {
+    let g = &entry.geometry;
+    entry.chrome.set_collapsed(entry.collapsed);
+    let (min_w, min_h) = entry.chrome.min_size(g.w);
+    let saved = Rect { x: g.x, y: g.y, w: g.w, h: g.h };
+    let fitted = crate::platform::geometry::fit_rect(saved, entry.collapsed, min_w, min_h);
+    placement_rect(fitted, bounds)
 }
 
 /// Clamp a note's saved rect to its surface's (monitor-local) bounds so a note
@@ -106,11 +133,15 @@ fn remove_stale(ctrl: &mut Controller, surf_idx: usize) {
 /// Phase 2 of a surface reconcile: add fresh views for new ids and move existing
 /// ones to the model rect, then rebuild + apply the input region and repaint.
 ///
-/// ALWAYS enforce the card's size to the note geometry (w,h): `Fixed::put`/`move_`
-/// set only position, so without this the card auto-grows to its content height
-/// and the bottom falls outside the input region (the dead-zone bug). With the
-/// content wrapped in a non-natural-size ScrolledWindow, `set_size_request` pins
-/// the footprint to exactly the geometry rect == input region.
+/// ALWAYS enforce the card's size to the rect from `effective_rect`: `Fixed::put`/
+/// `move_` set only position, so without this the card auto-grows to its content
+/// height and the bottom falls outside the input region (the dead-zone bug).
+///
+/// `set_size_request` is a FLOOR, not an exact size — GTK allocates the child's own
+/// requisition when that is larger (measured: a 160px-wide note is drawn 200px wide
+/// by its header row). That is exactly why the rect comes from `effective_rect`,
+/// which already grew it to what GTK will allocate. Widget and region are fed the
+/// SAME rect below, so the footprint and the input region cannot drift apart.
 ///
 /// An empty surface still gets the (empty) region + repaint, clearing any ghost.
 fn add_present_repaint(ctrl: &mut Controller, surf_idx: usize) {

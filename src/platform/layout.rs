@@ -23,6 +23,12 @@ pub struct Geometry {
 #[derive(Serialize, Deserialize)]
 struct NoteLayout {
     geometry: Geometry,
+    /// Rolled up to its header bar (window-shade). Presentation state, kept
+    /// beside the geometry rather than inside it: `Geometry` stays purely
+    /// spatial, so its `PartialEq` and the monitor resolvers never see it.
+    /// `#[serde(default)]` keeps pre-collapse layout files loadable.
+    #[serde(default)]
+    collapsed: bool,
 }
 
 #[derive(Serialize, Deserialize, Default)]
@@ -41,8 +47,17 @@ impl Layout {
         self.inner.notes.get(id).map(|nl| &nl.geometry)
     }
 
-    pub fn set(&mut self, id: &str, g: Geometry) {
-        self.inner.notes.insert(id.to_string(), NoteLayout { geometry: g });
+    /// Whether note `id` is rolled up. Unknown ids are not collapsed.
+    pub fn collapsed(&self, id: &str) -> bool {
+        self.inner.notes.get(id).is_some_and(|nl| nl.collapsed)
+    }
+
+    /// Store geometry AND collapsed together — writing one without the other
+    /// would silently drop the roll-up state on every drag/resize commit.
+    pub fn set(&mut self, id: &str, g: Geometry, collapsed: bool) {
+        self.inner
+            .notes
+            .insert(id.to_string(), NoteLayout { geometry: g, collapsed });
     }
 
     pub fn remove(&mut self, id: &str) {
@@ -125,8 +140,8 @@ mod tests {
         let g2 = sample_geometry(2);
 
         let mut layout = Layout::default();
-        layout.set(id1, g1.clone());
-        layout.set(id2, g2.clone());
+        layout.set(id1, g1.clone(), false);
+        layout.set(id2, g2.clone(), false);
 
         save(&paths, &layout).unwrap();
 
@@ -165,7 +180,7 @@ mod tests {
 
         let id = "01JZ9P6S0R8ZX0G8N3Z4V7Y8QC";
         let mut layout = Layout::default();
-        layout.set(id, sample_geometry(3));
+        layout.set(id, sample_geometry(3), false);
 
         save(&paths, &layout).unwrap();
 
@@ -181,7 +196,7 @@ mod tests {
         let paths = make_paths(dir.path().to_str().unwrap());
 
         let mut layout = Layout::default();
-        layout.set("01JZ9P6S0R8ZX0G8N3Z4V7Y8QD", sample_geometry(4));
+        layout.set("01JZ9P6S0R8ZX0G8N3Z4V7Y8QD", sample_geometry(4), false);
 
         save(&paths, &layout).unwrap();
 
@@ -196,5 +211,63 @@ mod tests {
         let name_str = name.to_string_lossy();
         assert_eq!(name_str.as_ref(), "layout.toml", "file must be layout.toml");
         assert!(!name_str.contains(".tmp"), "no temp files should remain");
+    }
+
+    #[test]
+    fn a_layout_file_written_before_roll_up_existed_loads_as_not_collapsed() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = make_paths(dir.path().to_str().unwrap());
+
+        // Exactly the shape older Waynote versions wrote: a geometry table and
+        // no `collapsed` key anywhere.
+        let path = paths.layout_file();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &path,
+            b"[notes.01JZ9P6S0R8ZX0G8N3Z4V7Y8QK.geometry]\n\
+              output = \"DP-1\"\n\
+              output_desc = \"Dell U2720Q\"\n\
+              logical = [0, 0, 2560, 1440]\n\
+              x = 100\n y = 200\n w = 280\n h = 220\n",
+        )
+        .unwrap();
+
+        let loaded = load(&paths);
+        assert!(
+            loaded.get("01JZ9P6S0R8ZX0G8N3Z4V7Y8QK").is_some(),
+            "the old file must still load"
+        );
+        assert!(!loaded.collapsed("01JZ9P6S0R8ZX0G8N3Z4V7Y8QK"));
+    }
+
+    #[test]
+    fn a_collapsed_note_is_still_collapsed_after_save_and_load() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = make_paths(dir.path().to_str().unwrap());
+        let id = "01JZ9P6S0R8ZX0G8N3Z4V7Y8QE";
+
+        let mut layout = Layout::default();
+        layout.set(id, sample_geometry(5), true);
+        save(&paths, &layout).unwrap();
+
+        assert!(load(&paths).collapsed(id));
+    }
+
+    #[test]
+    fn moving_a_collapsed_note_keeps_it_collapsed() {
+        let id = "01JZ9P6S0R8ZX0G8N3Z4V7Y8QF";
+        let mut layout = Layout::default();
+        layout.set(id, sample_geometry(6), true);
+
+        // What a drag commit does: write the new geometry, carrying the flag.
+        layout.set(id, sample_geometry(7), layout.collapsed(id));
+
+        assert!(layout.collapsed(id), "a move must not unroll the note");
+        assert_eq!(layout.get(id), Some(&sample_geometry(7)));
+    }
+
+    #[test]
+    fn a_note_with_no_layout_entry_is_not_collapsed() {
+        assert!(!Layout::default().collapsed("never-seen"));
     }
 }

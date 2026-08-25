@@ -28,6 +28,28 @@ pub fn resize_to(start: Rect, dx: i32, dy: i32, min_w: i32, min_h: i32, bounds: 
     clamp_into(resized, bounds)
 }
 
+/// PURE: the rect a note occupies on screen, given its saved geometry and the size
+/// GTK will actually allocate its card (`min_w`/`min_h`, measured from the widget).
+///
+/// Two separate corrections, both required so the widget, the Wayland input region
+/// and the drag origin agree:
+///
+/// - **Width, and the height of an expanded note**, grow to the measured minimum.
+///   `set_size_request` is a FLOOR, and `GtkFixed` allocates the child's own
+///   requisition — a note narrower than its header row is DRAWN wider than its
+///   rect, so a region built from the saved width leaves a visible strip that
+///   swallows no clicks, with the rightmost buttons inside it.
+/// - **A rolled-up note takes the measured height outright**, discarding the saved
+///   one. That is the whole feature: `h` stays the expanded height to restore.
+///
+/// Deliberately NOT clamped here — the caller clamps into bounds AFTERWARDS.
+/// Clamping the expanded height first would push a rolled-up bar needlessly far
+/// from the bottom edge.
+pub fn fit_rect(saved: Rect, collapsed: bool, min_w: i32, min_h: i32) -> Rect {
+    let h = if collapsed { min_h } else { saved.h.max(min_h) };
+    Rect { w: saved.w.max(min_w), h, ..saved }
+}
+
 // used in Plan 4 (drag-to-move / auto-arrange)
 #[allow(dead_code)]
 pub fn grid_position(index: usize, per_col: usize, cell: (i32, i32), margin: (i32, i32), gap: i32) -> (i32, i32) {
@@ -126,5 +148,44 @@ mod tests {
         assert!(r.y >= bounds.y, "y must not go above bounds");
         assert_eq!(r.x, bounds.x, "oversized note pushed to left edge");
         assert_eq!(r.y, bounds.y, "oversized note pushed to top edge");
+    }
+
+    #[test]
+    fn rolling_up_takes_the_measured_bar_height_and_keeps_position_and_width() {
+        let saved = Rect { x: 120, y: 340, w: 280, h: 220 };
+        assert_eq!(
+            fit_rect(saved, true, 200, 43),
+            Rect { x: 120, y: 340, w: 280, h: 43 }
+        );
+    }
+
+    #[test]
+    fn an_expanded_note_keeps_its_saved_height() {
+        let saved = Rect { x: 0, y: 0, w: 280, h: 220 };
+        assert_eq!(fit_rect(saved, false, 200, 43).h, 220);
+    }
+
+    #[test]
+    fn a_note_narrower_than_its_header_reports_the_width_gtk_will_allocate() {
+        // A note can still be narrower than its header — an older layout.toml, or a
+        // theme whose controls measure wider than the 260px drag minimum. GTK draws
+        // the header's own width regardless, so the rect must report it or the input
+        // region leaves visible, unclickable card behind.
+        let saved = Rect { x: 0, y: 0, w: 160, h: 220 };
+        assert_eq!(fit_rect(saved, false, 200, 43).w, 200);
+        assert_eq!(fit_rect(saved, true, 200, 43).w, 200, "same while rolled up");
+    }
+
+    #[test]
+    fn a_note_wider_than_its_minimum_is_left_alone() {
+        let saved = Rect { x: 0, y: 0, w: 400, h: 220 };
+        assert_eq!(fit_rect(saved, false, 200, 43).w, 400);
+    }
+
+    #[test]
+    fn an_expanded_note_shorter_than_its_minimum_grows_to_it() {
+        // A huge font can push the card's own minimum past a small saved height.
+        let saved = Rect { x: 0, y: 0, w: 280, h: 30 };
+        assert_eq!(fit_rect(saved, false, 200, 60).h, 60);
     }
 }

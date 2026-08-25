@@ -92,14 +92,20 @@ tags: [inbox]
 - [ ] body…
 ```
 
-`layout.toml` (geometry by id):
+`layout.toml` (per-note view state by id):
 ```toml
+[notes.01JZ9P6S0R8ZX0G8N3Z4V7Y8QK]
+collapsed = false                    # rolled up to its header bar; absent = false
+
 [notes.01JZ9P6S0R8ZX0G8N3Z4V7Y8QK.geometry]
 output = "DP-1"
 output_desc = "Dell U2720Q ABC123"   # make/model/serial when available
 logical = [0, 0, 2560, 1440]         # last-known output logical geometry
 x = 72; y = 48; w = 280; h = 220
 ```
+
+`h` is always the EXPANDED height, even while `collapsed` is true — the bar's own
+height is measured from the live widget (theme/font dependent), never stored.
 
 Rules / contracts:
 - **Frontmatter = durable semantic metadata only**; **geometry is volatile/per-device** → `$XDG_STATE`, so git diffs/sync stay clean (Obsidian-style split).

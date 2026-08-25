@@ -147,6 +147,23 @@ waynote autostart on|off|status     # toggle the systemd user autostart
 waynote --render-demo               # open the markdown render demo window (dev)
 ```
 
+### Working with a note
+
+Each note carries a header bar: the title on the left, its controls on the right
+(colour, copy, lock, layer, pin, move-to-monitor, delete).
+
+| Gesture | Where | Does |
+| --- | --- | --- |
+| Drag | Header bar | Move the note |
+| Drag | Bottom-right grip `◢` | Resize the note |
+| Double-click | Note body | Edit the raw markdown (`Esc` saves) |
+| **Double-click** | **Header title** | **Roll the note up to its bar — again to unroll** |
+
+Rolling up hides everything but the header, so a note becomes a labelled strip you
+can still move, recolour or delete. The freed area goes click-through immediately,
+and the note's real size is remembered for when you unroll it. The state survives a
+restart: it lives in `layout.toml` beside the geometry, never in your `.md`.
+
 ### Window-manager keybinds
 
 The CLI verbs forward to the already-running instance (starting it if needed), so
