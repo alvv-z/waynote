@@ -51,9 +51,12 @@ users instead:
 
 ## Compatibility
 
-Waynote needs a compositor that implements `wlr-layer-shell`:
+Waynote needs a compositor that implements `wlr-layer-shell`.
 
-- ✅ **Supported:** Hyprland, Sway, river, Wayfire, niri, KDE/KWin, COSMIC.
+- ✅ **Verified:** Hyprland (current), Sway (last checked at 0.1.0).
+- 🟡 **Expected to work, not yet verified:** river, Wayfire, niri, KDE/KWin,
+  COSMIC. They implement `wlr-layer-shell`, so Waynote should run — but nobody
+  has tested it there. Reports are very welcome, good or bad.
 - ❌ **Not supported:** GNOME/Mutter (no layer-shell), X11, macOS, Windows.
 
 ## Install
@@ -246,10 +249,13 @@ keeping domain logic unit-testable without a display.
 Waynote 0.1.4 is feature-complete: notes on the Wayland desktop with faithful
 markdown rendering, persistence with live file-watching and conflict copies,
 per-note colour / lock / layer / pin / move-to-monitor controls, roll-up to the
-header bar, a system-tray item, image paste, and autostart. Verified live on
-Hyprland and Sway.
+header bar, a system-tray item, image paste, and autostart.
 
-Planned next: broader compositor verification, optional tags and filters, and
+Every release is exercised live on Hyprland. The other layer-shell compositors
+are untested — see [Compatibility](#compatibility).
+
+Planned next: verification on KDE/KWin and COSMIC (the two that are not
+wlroots-based, so the most likely to differ), optional tags and filters, and
 distro packaging beyond the AUR.
 
 ## Documentation
